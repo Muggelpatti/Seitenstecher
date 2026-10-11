@@ -88,6 +88,13 @@ header .sub{margin:6px 0 0;color:var(--muted)}
 .book .a{color:var(--muted)}
 .book .meta{font-size:13px;color:var(--muted);margin-top:3px}
 .book .side{display:flex;flex-direction:column;align-items:flex-end;gap:6px;font-size:13px}
+.rate{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+.stars{display:flex;gap:2px;margin-left:-6px}
+.star{border:0;background:none;padding:2px 6px;font-size:26px;line-height:1;color:var(--line)}
+.star.on{color:var(--loan)}
+.rsum{font-size:13px}
+.rwho{font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 12px;align-items:baseline}
+.rwho .label{font-size:10px}
 .pill{font-family:var(--mono);font-size:11px;letter-spacing:.05em;text-transform:uppercase;border-radius:2px;padding:2px 7px;white-space:nowrap}
 .pill.v{background:var(--stamp-soft);color:var(--stamp)}
 .pill.e{border:1px solid var(--line);color:var(--muted)}
@@ -171,6 +178,7 @@ form input,form select,form textarea{border:1px solid var(--line);background:var
       <button class="chip" data-f="vorgestellt" aria-pressed="false">Vorgestellt</button>
       <button class="chip" data-f="erwaehnt" aria-pressed="false">Erwähnt</button>
       <button class="chip" data-f="verliehen" aria-pressed="false">Verliehen</button>
+      <button class="chip" data-f="top" aria-pressed="false">Beste zuerst</button>
       <input id="q" type="search" placeholder="Titel, Autor, Person" aria-label="Bücher durchsuchen">
     </div>
     <ul class="books" id="books"></ul>
@@ -233,7 +241,7 @@ const store = { get(k){ try { return localStorage.getItem(k); } catch { return n
 const configured = !SUPABASE_URL.startsWith("HIER") && !SUPABASE_KEY.startsWith("HIER");
 const sb = configured ? supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 
-let books = [], meets = [], notes = [], filter = store.get("ss-filter") || "alle", editBook = null, editMeet = null, liveId = null, me = store.get("ss-name") || "";
+let books = [], meets = [], notes = [], ratings = [], filter = store.get("ss-filter") || "alle", editBook = null, editMeet = null, liveId = null, me = store.get("ss-name") || "";
 
 function people(){
   const s = new Set(MEMBERS);
@@ -250,11 +258,35 @@ async function run(promise, msg){
 }
 
 async function load(){
-  const [b, m, n] = await Promise.all([
-    sb.from("books").select("*"), sb.from("meetings").select("*"), sb.from("notes").select("*").order("created_at", {ascending:false})
+  const [b, m, n, r] = await Promise.all([
+    sb.from("books").select("*"), sb.from("meetings").select("*"), sb.from("notes").select("*").order("created_at", {ascending:false}),
+    sb.from("ratings").select("*")
   ]);
   if (b.error || m.error || n.error){ fail("Daten konnten nicht geladen werden. Lade die Seite neu."); return; }
-  books = b.data; meets = m.data; notes = n.data; render();
+  books = b.data; meets = m.data; notes = n.data; ratings = r.error ? [] : r.data; render();
+}
+
+const ratingsOf = b => ratings.filter(r => r.book_id === b.id);
+const avgOf = b => { const rs = ratingsOf(b); return rs.length ? rs.reduce((a, r) => a + r.stars, 0) / rs.length : 0; };
+function ratingHtml(b){
+  const rs = [...ratingsOf(b)].sort((x, y) => x.person.localeCompare(y.person, "de"));
+  const mine = rs.find(r => r.person === me);
+  const avg = avgOf(b).toFixed(1).replace(".", ",");
+  return `<div class="rate">
+    <div class="stars" role="group" aria-label="Deine Bewertung">${[1,2,3,4,5].map(i =>
+      `<button type="button" class="star${mine && i <= mine.stars ? " on" : ""}" data-rate="${esc(b.id)}:${i}" aria-label="${i} ${i === 1 ? "Stern" : "Sterne"}" aria-pressed="${!!mine && mine.stars === i}">★</button>`).join("")}</div>
+    ${rs.length
+      ? `<div class="rsum"><b>${avg}</b> von 5 · ${rs.length} ${rs.length === 1 ? "Bewertung" : "Bewertungen"}</div>
+         <div class="rwho"><span class="label">Gelesen von</span>${rs.map(r => `<span>${esc(r.person)} ${r.stars}★</span>`).join("")}</div>`
+      : `<div class="rsum muted">Noch nicht bewertet. Tippe auf die Sterne, wenn du es gelesen hast.</div>`}
+  </div>`;
+}
+async function setRating(bookId, stars){
+  const cur = ratings.find(r => r.book_id === bookId && r.person === me);
+  const p = cur && cur.stars === stars
+    ? sb.from("ratings").delete().eq("book_id", bookId).eq("person", me)
+    : sb.from("ratings").upsert({ book_id: bookId, person: me, stars }, { onConflict: "book_id,person" });
+  await run(p, "Bewertung konnte nicht gespeichert werden.");
 }
 
 function render(){
@@ -296,9 +328,9 @@ function render(){
 
   const q = $("q").value.trim().toLowerCase();
   const list = books.filter(b =>
-    (filter === "alle" || (filter === "verliehen" ? !!b.loaned_to : b.status === filter)) &&
+    (filter === "alle" || (filter === "top" ? ratingsOf(b).length > 0 : filter === "verliehen" ? !!b.loaned_to : b.status === filter)) &&
     (!q || [b.title,b.author,b.presented_by,b.owner,b.loaned_to,b.note].join(" ").toLowerCase().includes(q))
-  ).sort((a,b) => (a.title||"").localeCompare(b.title||"", "de"));
+  ).sort((a,b) => filter === "top" ? (avgOf(b) - avgOf(a)) || (ratingsOf(b).length - ratingsOf(a).length) : (a.title||"").localeCompare(b.title||"", "de"));
   $("bookCount").textContent = books.length || "";
   document.querySelectorAll(".chip").forEach(x => x.setAttribute("aria-pressed", x.dataset.f === filter));
   $("books").innerHTML = list.length ? list.map(b => {
@@ -309,14 +341,14 @@ function render(){
     ].filter(Boolean).join(" · ");
     return `<li class="book">
       <div><div class="t">${esc(b.title)}</div><div class="a">${esc(b.author)}</div>
-        ${meta ? `<div class="meta">${meta}</div>` : ""}${b.note ? `<div class="meta">${esc(b.note)}</div>` : ""}</div>
+        ${meta ? `<div class="meta">${meta}</div>` : ""}${b.note ? `<div class="meta">${esc(b.note)}</div>` : ""}${ratingHtml(b)}</div>
       <div class="side">
         <span class="pill ${b.status === "erwaehnt" ? "e" : "v"}">${b.status === "erwaehnt" ? "Erwähnt" : "Vorgestellt"}</span>
         ${b.loaned_to ? `<span class="pill l">bei ${esc(b.loaned_to)}</span>` : ""}
         <button class="link" data-edit="${esc(b.id)}">Bearbeiten / verleihen</button>
         <a href="${amazon(b.title, b.author)}" target="_blank" rel="noopener">Bei Amazon kaufen</a>
       </div></li>`;
-  }).join("") : `<li class="empty" style="margin-top:12px">${books.length ? "Kein Buch passt zu diesem Filter." : "Noch keine Bücher. Hier erscheinen alle vorgestellten und erwähnten Titel."}</li>`;
+  }).join("") : `<li class="empty" style="margin-top:12px">${books.length ? (filter === "top" ? "Noch kein Buch bewertet." : "Kein Buch passt zu diesem Filter.") : "Noch keine Bücher. Hier erscheinen alle vorgestellten und erwähnten Titel."}</li>`;
 
   $("meetCount").textContent = meets.length || "";
   $("meets").innerHTML = meets.length ? [...sorted].reverse().map(m => {
@@ -423,9 +455,10 @@ $("q").addEventListener("input", render);
 $("liveMeet").addEventListener("change", () => { liveId = $("liveMeet").value; render(); });
 document.querySelectorAll(".chip").forEach(c => c.addEventListener("click", () => { filter = c.dataset.f; store.set("ss-filter", filter); render(); }));
 document.addEventListener("click", e => {
-  const el = e.target.closest("[data-edit],[data-medit],[data-back],[data-ndel],[data-show]"); if (!el) return;
+  const el = e.target.closest("[data-edit],[data-medit],[data-back],[data-ndel],[data-show],[data-rate]"); if (!el) return;
   const d = el.dataset;
-  if (d.edit) openBook(books.find(b => b.id === d.edit));
+  if (d.rate){ const i = d.rate.lastIndexOf(":"); setRating(d.rate.slice(0, i), +d.rate.slice(i + 1)); }
+  else if (d.edit) openBook(books.find(b => b.id === d.edit));
   else if (d.medit) openMeet(meets.find(m => m.id === d.medit));
   else if (d.show){ liveId = d.show; render(); $("liveMeet").scrollIntoView({behavior:"smooth", block:"center"}); }
   else if (d.back){ el.disabled = true; run(sb.from("books").update({loaned_to:"", loaned_since:null}).eq("id", d.back), "Rückgabe konnte nicht gespeichert werden."); }
